@@ -1,123 +1,98 @@
 import os
-import math
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-# Pulling structures directly from your code files
 from model import EEG_COORDS, WaveletGNN
 from dataloader import load_bci_data_cv
 
-def generate_gnn_attention_map(mat_train_path, mat_val_path, model_checkpoint_path, threshold=0.15, save_name="learned_gnn_pathways.png"):
-    """
-    Loads exact channel configurations from dataset files, initialises the WaveletGNN topology,
-    and maps the learned GAT attention connections onto a scalp projection figure.
-    """
-    # 1. Dynamically read the exact parameters and channel names from your actual data files
-    print("Reading dataset configurations for graph visualization...")
+def generate_true_gnn_attention(mat_train_path, mat_val_path, model_checkpoint_path, save_name="learned_gnn_pathways.png"):
+    # 1. Load data settings
     X, y, fs, _, class_names, channel_names = load_bci_data_cv(
-        mat_train_path, 
-        mat_val_path, 
-        include_validation=True
+        mat_train_path, mat_val_path, include_validation=True
     )
     
-    # 2. Extract configurations matching your training settings
-    n_channels = X.shape[1]      # Will accurately read 64
-    n_classes = len(class_names)  # Will accurately read 5 (matching your core checkpoint matrix)
+    n_channels = X.shape[1]
+    n_classes = len(class_names)
 
-    # 3. Instantiate model with real data properties
-    model = WaveletGNN(
-        n_channels=n_channels,
-        n_classes=n_classes,
-        channel_names=channel_names
-    ).to('cpu')
-    
-    # 4. Safely load your trained weights matrix
+    # 2. Instantiate and load model weights
+    model = WaveletGNN(n_channels=n_channels, n_classes=n_classes, channel_names=channel_names)
     if os.path.exists(model_checkpoint_path):
         model.load_state_dict(torch.load(model_checkpoint_path, map_location='cpu'))
-        print(f"✅ Successfully loaded trained checkpoint weights: {model_checkpoint_path}")
+        print(f"✅ Loaded weights from: {model_checkpoint_path}")
     else:
-        print("⚠️ Specified checkpoint not found. Rendering fallback visualization using template weights.")
+        print("⚠️ Checkpoint missing. Plotting template parameters.")
 
     model.eval()
 
-    # 5. Collect learned attention vectors from GAT1 layer
+    # 3. CRITICAL FIX: Capture real attention coefficients dynamically from the forward hook
+    # PyG's GATConv stores the latest forward multi-head attention matrix during evaluation execution paths.
+    # We pass a single real data trial from your X block through the node feature pipeline.
     with torch.no_grad():
-        att_src = model.gat1.att_src.squeeze(0).numpy() # [heads, hidden_dim]
-        att_dst = model.gat1.att_dst.squeeze(0).numpy() # [heads, hidden_dim]
-    
-    # Extract underlying adjacency links from model buffer memory
-    edge_index = model.edge_index.cpu().numpy() # [2, E]
-    src_nodes = edge_index[0]
-    dst_nodes = edge_index[1]
+        dummy_x = torch.tensor(X[:1], dtype=torch.float32) # Take 1 trial batch
+        node_feats = model._node_features(dummy_x)        # [64, node_feat_dim]
+        
+        # Call GATConv1 layer manually with return_attention_weights=True flag activated
+        edge_index_out, alpha = model.gat1(node_feats, model.edge_index, return_attention_weights=True)
+        
+        # Average attention weights across your 4 heads
+        alpha_mean = alpha.mean(dim=1).cpu().numpy() 
+        edge_index_np = edge_index_out.cpu().numpy()
 
-    # 6. Plot initialization
+    # 4. Canvas Setup
     fig, ax = plt.subplots(figsize=(9, 9))
-    
-    # Render baseline outer head bounding ring
-    circle = plt.Circle((0, 0), 1.0, color='gray', fill=False, linestyle=':', linewidth=1.5, alpha=0.6)
+    circle = plt.Circle((0, 0), 1.0, color='gray', fill=False, linestyle=':', linewidth=1.5, alpha=0.5)
     ax.add_patch(circle)
 
-    # 7. Map physical sensor dots onto the canvas grid
-    valid_names = [c.strip() for c in channel_names[:n_channels]]
+    # 5. Plot Electrode Nodes
+    valid_names = [c.strip() for c in channel_names[:64]]
     node_positions = {}
-    
     for idx, name in enumerate(valid_names):
         if name in EEG_COORDS:
             x, y = EEG_COORDS[name]
             node_positions[idx] = (x, y)
-            ax.scatter(x, y, color='#1f77b4', s=140, edgecolor='black', linewidths=0.7, zorder=4)
-            ax.text(x, y + 0.03, name, fontsize=8, ha='center', va='bottom', fontweight='bold', alpha=0.8)
+            ax.scatter(x, y, color='#1f77b4', s=130, edgecolor='black', linewidths=0.7, zorder=4)
+            ax.text(x, y + 0.03, name, fontsize=8, ha='center', va='bottom', fontweight='bold', alpha=0.7)
 
-    # 8. Filter links exceeding focus thresholds and draw path lines
-    drawn_links_count = 0
-    for idx in range(edge_index.shape[1]):
-        u, v = src_nodes[idx], dst_nodes[idx]
+    # 6. Normalize attention weights for visible line scale contrast
+    alpha_normalized = (alpha_mean - alpha_mean.min()) / (alpha_mean.max() - alpha_mean.min() + 1e-8)
+    
+    # 7. Dynamically filter and render top 15% highest attention connections across the scalp
+    top_threshold = np.percentile(alpha_normalized, 85) 
+    drawn_links = 0
+
+    for idx in range(edge_index_np.shape[1]):
+        u, v = edge_index_np[0, idx], edge_index_np[1, idx]
+        weight = alpha_normalized[idx]
         
-        # Omit identity self-loops for cleaner graph visibility
-        if u == v:
-            continue
-            
-        if u in node_positions and v in node_positions:
+        if u == v: continue # Omit self loops for plot readability
+        
+        if weight > top_threshold and u in node_positions and v in node_positions:
             x_u, y_u = node_positions[u]
             x_v, y_v = node_positions[v]
             
-            # Replicating the attention dot product calculation scalar projection
-            pseudo_weight = np.abs(np.dot(att_src[0], att_dst[0])) % 0.4
-            
-            if pseudo_weight > threshold:
-                ax.plot([x_u, x_v], [y_u, y_v], color='#d62728', alpha=float(pseudo_weight * 2), 
-                        linewidth=float(pseudo_weight * 8), zorder=2)
-                drawn_links_count += 1
+            # Line thickness and alpha driven by actual model attention weights
+            ax.plot([x_u, x_v], [y_u, y_v], color='#d62728', 
+                    alpha=float(weight * 0.8), 
+                    linewidth=float(weight * 3.5), zorder=2)
+            drawn_links += 1
 
-    # 9. Style application and canvas rendering
-    ax.set_title("Learned GNN Spatial Attention Pathways\n(Top-Tier Electrode Linkages)", 
+    ax.set_title("Learned GNN Spatial Attention Pathways\n(Dynamic Multi-Head Connection Strengths)", 
                  fontsize=13, fontweight='bold', pad=15)
     ax.set_xlim(-1.15, 1.15)
     ax.set_ylim(-1.15, 1.15)
     plt.axis('off')
     plt.tight_layout()
     
-    # Save chart
     output_path = os.path.join("results", save_name)
-    os.makedirs("results", exist_ok=True)
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"📊 Visualization generated and saved to: {output_path} ({drawn_links_count} structural lines rendered)")
-
+    print(f"📊 True performance graph generated. Saved to: {output_path} ({drawn_links} pathways mapped)")
 
 if __name__ == '__main__':
-    # Define paths pointing directly to your dataset directory files
     DATA_BASE = '/media/csedept/cse2018/Project/Codes/2nd approach/C1/'
-    TRAIN_MAT = DATA_BASE + 'Train/Data_Sample01.mat'
-    VAL_MAT   = DATA_BASE + 'Validation/Data_Sample01.mat'
-    
-    # Update this path to target your required model file checkpoint
-    CHECKPOINT = 'checkpoints/S01_fold1.pt'
-
-    generate_gnn_attention_map(
-        mat_train_path=TRAIN_MAT,
-        mat_val_path=VAL_MAT,
-        model_checkpoint_path=CHECKPOINT,
-        threshold=0.12 # Adjust to control how many top connection lines show up
+    generate_true_gnn_attention(
+        mat_train_path=DATA_BASE + 'Train/Data_Sample01.mat',
+        mat_val_path=DATA_BASE + 'Validation/Data_Sample01.mat',
+        model_checkpoint_path='checkpoints/S01_fold1.pt'
     )
